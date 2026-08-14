@@ -597,16 +597,22 @@ export function apply(ctx) {
       // QR is generated locally: sending it to a third-party image service would leak the binding credential.
       let qrTerminal = ''
       let qrPngPath = ''
+      let qrAttachment = null
       try {
         qrTerminal = await QRCode.toString(qrContent, { type: 'terminal', small: true })
+        const pngBuffer = await QRCode.toBuffer(qrContent, { width: 280, margin: 2 })
         mkdirSync(stateDir, { recursive: true })
         qrPngPath = join(stateDir, 'qrcode.png')
-        await QRCode.toFile(qrPngPath, qrContent, { width: 280, margin: 2 })
+        writeFileSync(qrPngPath, pngBuffer, { mode: 0o600 })
         chmodSync(qrPngPath, 0o600)
+        const attachments = ctx.get('attachments')
+        if (attachments !== undefined) {
+          qrAttachment = await attachments.saveImage({ data: new Uint8Array(pngBuffer), mediaType: 'image/png' })
+        }
       } catch (error) {
         console.error('[weixin] local QR render failed:', error)
       }
-      login = { phase: 'waiting', qrcode, qrContent, qrTerminal, qrPngPath, baseUrl: DEFAULT_BASE_URL, message: '请用微信扫码并确认' }
+      login = { phase: 'waiting', qrcode, qrContent, qrTerminal, qrPngPath, qrAttachment, baseUrl: DEFAULT_BASE_URL, message: '请用微信扫码并确认' }
       saveState()
     } catch (error) {
       login = { phase: 'error', message: String(error && error.message ? error.message : error) }
@@ -658,26 +664,34 @@ export function apply(ctx) {
           qrUrl: { type: 'string' },
           qrTerminal: { type: 'string' },
           qrPngPath: { type: 'string' },
+          qrAttachment: { type: 'object' },
         },
         required: ['phase', 'message'],
       },
       render(_args, value) {
+        const blocks = []
         const parts = [value.message || '']
-        if (value.qrTerminal) parts.push(value.qrTerminal)
-        if (value.qrPngPath) parts.push(`二维码图片（本地）: ${value.qrPngPath}`)
-        if (!value.qrTerminal && !value.qrPngPath && value.qrUrl) parts.push(`二维码URL: ${value.qrUrl}`)
-        return [{ type: 'text', text: parts.join('\n') }]
+        if (!value.qrAttachment) {
+          if (value.qrTerminal) parts.push(value.qrTerminal)
+          if (value.qrPngPath) parts.push(`二维码图片（本地）: ${value.qrPngPath}`)
+          if (!value.qrTerminal && !value.qrPngPath && value.qrUrl) parts.push(`二维码URL: ${value.qrUrl}`)
+        }
+        blocks.push({ type: 'text', text: parts.join('\n') })
+        if (value.qrAttachment) blocks.push({ type: 'image', attachment: value.qrAttachment })
+        return blocks
       },
     },
     async execute(args) {
       const state = await startLogin(String(args.workspaceId || ''))
-      return {
+      const result = {
         phase: state.login.phase,
         message: state.login.message,
         qrUrl: state.login.qrContent || '',
         qrTerminal: state.login.qrTerminal || '',
         qrPngPath: state.login.qrPngPath || '',
       }
+      if (state.login.qrAttachment) result.qrAttachment = state.login.qrAttachment
+      return result
     },
   })
 
