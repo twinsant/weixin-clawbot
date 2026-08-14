@@ -406,6 +406,7 @@ export function apply(ctx) {
   // TOFU: the first sender after binding becomes the only trusted one.
   function isTrustedSender(sender) {
     if (allowedSenders.includes(sender)) return true
+    if (sender === 'unknown') return false
     if (allowedSenders.length === 0) {
       allowedSenders = [sender]
       saveState()
@@ -683,10 +684,13 @@ export function apply(ctx) {
     },
     async execute(args) {
       const state = await startLogin(String(args.workspaceId || ''))
+      // qrUrl (the binding credential) enters the model context only as a
+      // last-resort fallback when no local rendering succeeded.
+      const rendered = Boolean(state.login.qrAttachment || state.login.qrTerminal || state.login.qrPngPath)
       const result = {
         phase: state.login.phase,
         message: state.login.message,
-        qrUrl: state.login.qrContent || '',
+        qrUrl: rendered ? '' : (state.login.qrContent || ''),
         qrTerminal: state.login.qrTerminal || '',
         qrPngPath: state.login.qrPngPath || '',
       }

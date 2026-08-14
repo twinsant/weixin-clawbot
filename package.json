@@ -3,14 +3,12 @@
   "version": "1.0.0",
   "description": "WeChat clawbot bridge plugin for DeepSeek Harness",
   "main": "weixin-clawbot.mjs",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
+  "scripts": {},
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "twinsant",
+  "license": "MIT",
   "type": "module",
-  "private": "true",
+  "private": true,
   "dependencies": {
     "qrcode": "^1.5.4"
   }
