@@ -1,13 +1,17 @@
 # WeChat Clawbot Bridge
 
+English | [中文](README.zh-CN.md)
+
 A persistent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) host plugin that binds a WeChat clawbot via the iLink QR protocol and bridges its messages into a per-day session of a chosen workspace.
 
 ## Features
 
-- **QR login** — `weixin_bind(workspaceId)` returns a scannable QR; `weixin_submit_code` handles the verify-code step.
+- **QR login** — `weixin_bind(workspaceId)` renders a scannable QR locally (terminal art + PNG under `$DSH_HOME/weixin-clawbot/`; never sent to third-party image services); `weixin_submit_code` handles the verify-code step.
 - **Bidirectional bridge** — long-polls `getupdates`, forwards inbound text / voice transcription / images into a `weixin-YYYY-MM-DD` session, and sends the agent's reply back to WeChat via `sendmessage`.
 - **Persistence** — token / cursor / target workspace are stored in `$DSH_HOME/weixin-clawbot/state.json` (mode 600). On restart the plugin restores the binding and resumes polling automatically — no re-scan.
 - **Daily reset** — one session per day; the same day's session is resumed across restarts.
+- **Sender allowlist (TOFU)** — the first WeChat sender after binding becomes the only trusted one; messages from anyone else are dropped (re-bind or unbind to reset). This blocks prompt injection from strangers into a tool-capable agent.
+- **Media hardening** — image downloads are restricted to the WeChat CDN (`*.qq.com`, https only) and capped at 20 MB.
 
 ## Tools
 
@@ -20,6 +24,10 @@ A persistent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 | `weixin_unbind()` | unbind and stop polling |
 
 ## Install
+
+```sh
+npm install   # installs the local `qrcode` dependency
+```
 
 Register it in the dsh profile's patch layer, e.g. `~/.dsh/profiles/web/cordis.patch.yml`:
 

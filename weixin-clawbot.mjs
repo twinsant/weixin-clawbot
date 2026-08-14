@@ -16,6 +16,7 @@ import { createDecipheriv } from 'node:crypto'
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import QRCode from 'qrcode'
 
 export const name = 'weixin-clawbot'
 export const inject = ['timer', 'tools']
@@ -28,11 +29,13 @@ const BOT_AGENT = 'QclawLogin/1.0'
 const SOURCE_PLUGIN = 'weixin-clawbot'
 const LONG_POLL_TIMEOUT_MS = 40_000
 const API_TIMEOUT_MS = 15_000
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 export function apply(ctx) {
   // ---- runtime state (restored from disk on startup) ----
   let bound = null // { accountId, token, baseUrl }
   let targetWorkspaceId = null
+  let allowedSenders = [] // TOFU: first inbound sender after binding is trusted; others are dropped
   let cursor = ''
   let pendingCode = null
   let login = { phase: 'idle', message: '未绑定' }
@@ -60,6 +63,7 @@ export function apply(ctx) {
       bound: Boolean(bound),
       accountId: bound ? bound.accountId : null,
       targetWorkspaceId,
+      allowedSenders: [...allowedSenders],
       login,
     }
   }
@@ -83,8 +87,10 @@ export function apply(ctx) {
         token: bound ? bound.token : null,
         cursor,
         workspaceId: targetWorkspaceId,
+        allowedSenders,
       }
-      writeFileSync(stateFile, `${JSON.stringify(payload, null, 2)}\n`)
+      // mode on create closes the 644→600 chmod race; chmod covers pre-existing files
+      writeFileSync(stateFile, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
       chmodSync(stateFile, 0o600)
     } catch (error) {
       console.error('[weixin] saveState failed:', error)
@@ -97,6 +103,7 @@ export function apply(ctx) {
       bound = { accountId: s.accountId || 'unknown', token: s.token, baseUrl: s.baseUrl || DEFAULT_BASE_URL }
       cursor = typeof s.cursor === 'string' ? s.cursor : ''
       targetWorkspaceId = typeof s.workspaceId === 'string' ? s.workspaceId : null
+      allowedSenders = Array.isArray(s.allowedSenders) ? s.allowedSenders.filter(v => typeof v === 'string' && v) : []
       login = { phase: 'confirmed', message: `已恢复绑定：${s.accountId || 'unknown'}` }
       console.log('[weixin] restored bound account', s.accountId || 'unknown')
     }
@@ -128,7 +135,8 @@ export function apply(ctx) {
       })
       const text = await res.text()
       if (!res.ok || !text) {
-        throw new Error(`HTTP ${res.status} ${text.slice(0, 200)}`)
+        // response body is not included: it may carry tokens or account data
+        throw new Error(`HTTP ${res.status}${text ? '' : ' (empty body)'}`)
       }
       return JSON.parse(text)
     } finally {
@@ -204,6 +212,29 @@ export function apply(ctx) {
     return `[类型 ${t}]`
   }
 
+  // Message-supplied URLs may point anywhere (SSRF); only trust the WeChat CDN.
+  function isAllowedMediaUrl(url) {
+    try {
+      const u = new URL(url)
+      return u.protocol === 'https:' && (u.hostname === 'qq.com' || u.hostname.endsWith('.qq.com'))
+    } catch {
+      return false
+    }
+  }
+
+  async function readBodyCapped(res, maxBytes) {
+    const declared = Number(res.headers.get('content-length'))
+    if (Number.isFinite(declared) && declared > maxBytes) return null
+    const chunks = []
+    let total = 0
+    for await (const chunk of res.body) {
+      total += chunk.length
+      if (total > maxBytes) return null
+      chunks.push(chunk)
+    }
+    return Buffer.concat(chunks)
+  }
+
   async function downloadDecryptImage(item) {
     const img = item.image_item
     if (!img || !img.media) return null
@@ -211,18 +242,23 @@ export function apply(ctx) {
     if (!media.full_url && !media.encrypt_query_param) return null
     const url = media.full_url
       || `${CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(media.encrypt_query_param)}`
+    if (!isAllowedMediaUrl(url)) {
+      console.error('[weixin] rejected media url outside WeChat CDN')
+      return null
+    }
     const key = keyToBuffer(img.aeskey, media.aes_key)
     try {
       const controller = new AbortController()
       const timer = ctx.timeout(() => controller.abort(), API_TIMEOUT_MS)
-      let res
+      let encrypted
       try {
-        res = await fetch(url, { signal: controller.signal })
+        const res = await fetch(url, { signal: controller.signal })
+        if (!res.ok) return null
+        encrypted = await readBodyCapped(res, MAX_IMAGE_BYTES)
       } finally {
         timer()
       }
-      if (!res.ok) return null
-      const encrypted = Buffer.from(await res.arrayBuffer())
+      if (!encrypted) return null
       let data
       if (key) {
         const decipher = createDecipheriv('aes-128-ecb', key, null)
@@ -362,12 +398,34 @@ export function apply(ctx) {
   }
 
   // ---- inbound forwarding ----
+  // Prevents the sender header from being spoofed inside message bodies.
+  function sanitizeInbound(text) {
+    return String(text).replace(/\[微信/g, '［微信')
+  }
+
+  // TOFU: the first sender after binding becomes the only trusted one.
+  function isTrustedSender(sender) {
+    if (allowedSenders.includes(sender)) return true
+    if (allowedSenders.length === 0) {
+      allowedSenders = [sender]
+      saveState()
+      console.log('[weixin] trusted first sender', sender)
+      return true
+    }
+    return false
+  }
+
   async function forwardMessage(msg) {
     if (!targetWorkspaceId) {
       console.error('[weixin] no target workspace; dropping message')
       return
     }
-    const sender = msg.from_user_id || msg.from_user || msg.fromUser || 'unknown'
+    const sender = String(msg.from_user_id || msg.from_user || msg.fromUser || 'unknown')
+    const senderLabel = sender.replace(/[\[\]\r\n]/g, '')
+    if (!isTrustedSender(sender)) {
+      console.error('[weixin] dropping message from untrusted sender', senderLabel)
+      return
+    }
     const contextToken = typeof msg.context_token === 'string' && msg.context_token ? msg.context_token : null
     const items = Array.isArray(msg.item_list) ? msg.item_list : []
     const text = buildText(msg)
@@ -393,14 +451,14 @@ export function apply(ctx) {
       }
     }
 
-    const head = [`[微信 · ${sender}]`]
+    const head = [`[微信 · ${senderLabel}]`]
     if (text) {
-      head.push(text)
+      head.push(sanitizeInbound(text))
     } else {
       for (const item of items) {
         if (!item || typeof item !== 'object') continue
         if (item.type === 1 || item.type === 3) continue
-        head.push(mediaSummary(item, imageAttached))
+        head.push(sanitizeInbound(mediaSummary(item, imageAttached)))
       }
       if (head.length === 1) head.push('(无文本内容)')
     }
@@ -499,6 +557,7 @@ export function apply(ctx) {
         bound = { accountId, token, baseUrl: String(retBase).replace(/\/+$/, '') }
         cursor = ''
         pendingCode = null
+        allowedSenders = []
         login = { phase: 'confirmed', message: `绑定成功：${accountId}` }
         saveState()
       } else {
@@ -535,7 +594,19 @@ export function apply(ctx) {
       if (typeof qrcode !== 'string' || !qrcode || typeof qrContent !== 'string' || !qrContent) {
         throw new Error(`QR 响应缺少 qrcode 或 qrcode_img_content：${JSON.stringify(resp)}`)
       }
-      login = { phase: 'waiting', qrcode, qrContent, baseUrl: DEFAULT_BASE_URL, message: '请用微信扫码并确认' }
+      // QR is generated locally: sending it to a third-party image service would leak the binding credential.
+      let qrTerminal = ''
+      let qrPngPath = ''
+      try {
+        qrTerminal = await QRCode.toString(qrContent, { type: 'terminal', small: true })
+        mkdirSync(stateDir, { recursive: true })
+        qrPngPath = join(stateDir, 'qrcode.png')
+        await QRCode.toFile(qrPngPath, qrContent, { width: 280, margin: 2 })
+        chmodSync(qrPngPath, 0o600)
+      } catch (error) {
+        console.error('[weixin] local QR render failed:', error)
+      }
+      login = { phase: 'waiting', qrcode, qrContent, qrTerminal, qrPngPath, baseUrl: DEFAULT_BASE_URL, message: '请用微信扫码并确认' }
       saveState()
     } catch (error) {
       login = { phase: 'error', message: String(error && error.message ? error.message : error) }
@@ -555,6 +626,7 @@ export function apply(ctx) {
     bound = null
     cursor = ''
     pendingCode = null
+    allowedSenders = []
     login = { phase: 'idle', message: '未绑定' }
     saveState()
     return getState()
@@ -584,19 +656,28 @@ export function apply(ctx) {
           phase: { type: 'string' },
           message: { type: 'string' },
           qrUrl: { type: 'string' },
+          qrTerminal: { type: 'string' },
+          qrPngPath: { type: 'string' },
         },
         required: ['phase', 'message'],
       },
       render(_args, value) {
-        const qr = value.qrUrl
-          ? `\n二维码URL: ${value.qrUrl}\n扫码图片: https://api.qrserver.com/v1/create-qr-code/?size=280x280&margin=12&data=${encodeURIComponent(value.qrUrl)}`
-          : ''
-        return [{ type: 'text', text: (value.message || '') + qr }]
+        const parts = [value.message || '']
+        if (value.qrTerminal) parts.push(value.qrTerminal)
+        if (value.qrPngPath) parts.push(`二维码图片（本地）: ${value.qrPngPath}`)
+        if (!value.qrTerminal && !value.qrPngPath && value.qrUrl) parts.push(`二维码URL: ${value.qrUrl}`)
+        return [{ type: 'text', text: parts.join('\n') }]
       },
     },
     async execute(args) {
       const state = await startLogin(String(args.workspaceId || ''))
-      return { phase: state.login.phase, message: state.login.message, qrUrl: state.login.qrContent || '' }
+      return {
+        phase: state.login.phase,
+        message: state.login.message,
+        qrUrl: state.login.qrContent || '',
+        qrTerminal: state.login.qrTerminal || '',
+        qrPngPath: state.login.qrPngPath || '',
+      }
     },
   })
 
@@ -637,6 +718,7 @@ export function apply(ctx) {
           phase: { type: 'string' },
           message: { type: 'string' },
           workspaceId: { type: 'string' },
+          allowedSenders: { type: 'array', items: { type: 'string' } },
         },
         required: ['bound', 'phase', 'message'],
       },
@@ -652,6 +734,7 @@ export function apply(ctx) {
         phase: s.login.phase,
         message: s.login.message,
         workspaceId: s.targetWorkspaceId || '',
+        allowedSenders: s.allowedSenders,
       }
     },
   })
