@@ -373,6 +373,14 @@ export function apply(ctx) {
         console.error('[weixin] attach session failed:', error)
       }
     }
+    const titleService = ctx.get('sessionTitle')
+    if (titleService) {
+      try {
+        titleService.rename(handle.agent.session, `微信 · ${dateKey()}`)
+      } catch (error) {
+        console.error('[weixin] session rename failed:', error)
+      }
+    }
     return handle.agent
   }
 
