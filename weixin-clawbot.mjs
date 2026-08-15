@@ -416,6 +416,30 @@ export function apply(ctx) {
     return false
   }
 
+  // Whether the target agent's model can accept image content. Images are only
+  // attached when the model supports vision; otherwise the message degrades to
+  // a "[图片]" label (some adapters reject image blocks outright).
+  const modelSupportsImages = (() => {
+    let resolved = false
+    let supports = false
+    return async function check() {
+      if (resolved) return supports
+      resolved = true
+      try {
+        const adm = ctx.get('agentDefaultModel')
+        const llm = ctx.get('llm')
+        const sel = adm ? adm.currentSelection() : null
+        if (sel && sel.provider && sel.model && llm) {
+          const info = await llm.resolveModelInfo(sel.provider, sel.model)
+          if (info && Array.isArray(info.inputModalities)) supports = info.inputModalities.includes('image')
+        }
+      } catch (error) {
+        console.error('[weixin] model image support check failed:', error)
+      }
+      return supports
+    }
+  })()
+
   async function forwardMessage(msg) {
     if (!targetWorkspaceId) {
       console.error('[weixin] no target workspace; dropping message')
@@ -435,7 +459,7 @@ export function apply(ctx) {
     let imageAttached = false
     const imageItem = items.find(i => i && i.type === 2 && i.image_item && i.image_item.media
       && (i.image_item.media.full_url || i.image_item.media.encrypt_query_param))
-    if (imageItem) {
+    if (imageItem && await modelSupportsImages()) {
       const img = await downloadDecryptImage(imageItem)
       if (img) {
         try {
