@@ -41,6 +41,10 @@ export function apply(ctx) {
   let login = { phase: 'idle', message: '未绑定' }
   let loginInFlight = false
   let msgInFlight = false
+  let currentWeixinTarget = null // { senderId, contextToken } during the in-flight turn
+  let pendingApproval = null // { senderId, resolve } awaiting a text response
+  const dailyAgentIds = new Set() // session ids of agents this plugin created
+  let approvalPollInFlight = false
 
   // ---- durable state location ----
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -309,6 +313,7 @@ export function apply(ctx) {
       sessionId = `${baseId}-r${Date.now().toString(36)}`
       existing = undefined
     }
+    dailyAgentIds.add(sessionId)
     if (existing !== undefined) return existing
 
     const workspace = workspaceRegistry !== undefined ? workspaceRegistry.get(workspaceId) : undefined
@@ -448,6 +453,59 @@ export function apply(ctx) {
     }
   })()
 
+  // ---- HITL approval: route approval/request to a WeChat text prompt ----
+  function parseApprovalDecision(text) {
+    const t = String(text || '').trim().toLowerCase()
+    if (['允许', '同意', '是', 'yes', 'y', 'ok', 'allow', 'approve'].includes(t)) return 'allowed-once'
+    if (['拒绝', '否', '不', 'no', 'n', 'deny', 'reject'].includes(t)) return 'rejected'
+    return null
+  }
+
+  function answerWeixinApproval(req) {
+    return new Promise((resolve) => {
+      let settled = false
+      let timer = null
+      const onAbort = () => finish('cancelled')
+      const cleanup = () => {
+        if (pendingApproval && pendingApproval.resolve === finish) pendingApproval = null
+        if (req.signal) req.signal.removeEventListener('abort', onAbort)
+        if (timer) clearTimeout(timer)
+      }
+      const finish = (outcome) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(outcome)
+      }
+      if (req.signal) {
+        if (req.signal.aborted) return finish('cancelled')
+        req.signal.addEventListener('abort', onAbort, { once: true })
+      }
+      timer = setTimeout(() => finish('cancelled'), 5 * 60 * 1000)
+      pendingApproval = { senderId: currentWeixinTarget.senderId, resolve: finish }
+      const text = `⚠️ 需要审批\n工具: ${req.toolName}${req.reason ? `\n原因: ${req.reason}` : ''}\n请回复「允许」或「拒绝」`
+      sendTextReply(currentWeixinTarget.senderId, currentWeixinTarget.contextToken, text).catch((error) => {
+        console.error('[weixin] approval send failed:', error)
+        finish(null) // defer to other answerers
+      })
+    })
+  }
+
+  function registerApprovalAnswerer() {
+    ctx.on('approval/request', async (req, next) => {
+      if (!dailyAgentIds.has(String(req.agent && req.agent.id))) return next()
+      if (!currentWeixinTarget || !bound) return next()
+      try {
+        const outcome = await answerWeixinApproval(req)
+        if (outcome === null) return next()
+        return outcome
+      } catch (error) {
+        console.error('[weixin] approval answer failed:', error)
+        return next()
+      }
+    }, { prepend: true })
+  }
+
   async function forwardMessage(msg) {
     if (!targetWorkspaceId) {
       console.error('[weixin] no target workspace; dropping message')
@@ -499,6 +557,7 @@ export function apply(ctx) {
     const content = [{ type: 'text', text: head.join('\n') }]
     if (attachment) content.push({ type: 'image', attachment })
 
+    currentWeixinTarget = { senderId: sender, contextToken }
     try {
       const agent = await ensureDailyAgent(targetWorkspaceId)
       const startSeq = agent.session.events.length
@@ -519,6 +578,8 @@ export function apply(ctx) {
       }
     } catch (error) {
       console.error('[weixin] forward failed:', error)
+    } finally {
+      currentWeixinTarget = null
     }
   }
 
@@ -545,6 +606,45 @@ export function apply(ctx) {
       console.error('[weixin] message poll failed:', error)
     } finally {
       msgInFlight = false
+    }
+  }
+
+  // ---- approval response polling (runs while an approval is pending) ----
+  async function pollApprovalResponse() {
+    if (approvalPollInFlight || !pendingApproval || !bound) return
+    approvalPollInFlight = true
+    try {
+      const resp = await ilink(bound.baseUrl, 'POST', '/ilink/bot/getupdates', {
+        get_updates_buf: cursor,
+        base_info: { channel_version: CHANNEL_VERSION, bot_agent: BOT_AGENT },
+      }, bound.token, LONG_POLL_TIMEOUT_MS)
+      const newCursor = resp.get_updates_buf
+      if (typeof newCursor === 'string' && newCursor) {
+        cursor = newCursor
+        saveState()
+      }
+      const msgs = resp.msgs
+      if (Array.isArray(msgs)) {
+        for (const m of msgs) {
+          if (!m || typeof m !== 'object' || !pendingApproval) continue
+          const sender = String(m.from_user_id || m.from_user || m.fromUser || 'unknown')
+          if (sender !== pendingApproval.senderId) continue
+          const decision = parseApprovalDecision(buildText(m))
+          if (decision) {
+            const resolve = pendingApproval.resolve
+            pendingApproval = null
+            resolve(decision)
+          } else {
+            const ctx = typeof m.context_token === 'string' && m.context_token ? m.context_token : null
+            sendTextReply(sender, ctx, '请回复「允许」或「拒绝」').catch(() => {})
+          }
+          // consumed as an approval response; not forwarded as a new turn
+        }
+      }
+    } catch (error) {
+      console.error('[weixin] approval poll failed:', error)
+    } finally {
+      approvalPollInFlight = false
     }
   }
 
@@ -674,6 +774,10 @@ export function apply(ctx) {
   async function tick() {
     const p = login.phase
     if (p === 'waiting' || p === 'scanned' || p === 'need_code') await pollLogin()
+    if (pendingApproval) {
+      await pollApprovalResponse()
+      return
+    }
     if (bound) await pollMessages()
   }
 
@@ -840,5 +944,6 @@ export function apply(ctx) {
 
   // ---- startup: restore persisted binding, then start the poll loop ----
   restoreState()
+  registerApprovalAnswerer()
   ctx.interval(() => { void tick() }, 2000)
 }
