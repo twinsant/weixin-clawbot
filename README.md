@@ -12,7 +12,7 @@ A persistent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - **Daily reset** — one session per day; the same day's session is resumed across restarts.
 - **Sender allowlist (TOFU)** — the first WeChat sender after binding becomes the only trusted one; messages from anyone else are dropped (re-bind or unbind to reset). This blocks prompt injection from strangers into a tool-capable agent.
 - **Media hardening** — image downloads are restricted to the WeChat CDN (`*.qq.com`, https only) and capped at 20 MB. Images are attached inline only when the target model supports vision; otherwise they degrade to a `[图片]` label.
-- **Human-in-the-loop (HITL) approval** — when the agent escalates a sandboxed action (e.g. `bash` with `sandbox_permissions`), the plugin sends a `⚠️ 需要审批 … 回复「允许」或「拒绝」` prompt to WeChat and blocks the tool until you reply.
+- **Human-in-the-loop (HITL) approval** — when the agent escalates a sandboxed action (e.g. `bash` with `sandbox_permissions`), the plugin sends a `⚠️ 需要审批 … 回复「允许」或「拒绝」` prompt (including the tool's arguments) to WeChat and blocks the tool until you reply.
 
 ## Tools
 
