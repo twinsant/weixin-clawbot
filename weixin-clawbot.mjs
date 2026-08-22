@@ -279,7 +279,106 @@ export function apply(ctx) {
     }
   }
 
-  function collectAssistantText(events, startSeq) {
+  // ---- outbound reply ----
+  // Replaces raw image content with a short local-Ollama description so
+  // WeChat users receive readable text instead of an unopenable encrypted
+  // CDN link. Non-fatal: any failure degrades the image block to "[图片]".
+  const VISION_MODEL = process.env.OLLAMA_VISION_MODEL || 'qwen3.8:27b-mlx'
+  const VISION_TIMEOUT_MS = 60_000
+
+  function stripMarkdownImages(text) {
+    // ![alt](url) -> [图片：alt]; never forward the raw url as a link.
+    return String(text).replace(/!\[([^\]]*)\]\([^)\s]+\)/g, (_match, alt) => `[图片${alt ? `：${alt}` : ''}]`)
+  }
+
+  function stripWechatMediaLinks(text) {
+    // Encrypted/signed WeChat CDN urls are unopenable outside the client.
+    return String(text).replace(/https?:\/\/[^\s)]*(?:cdn\.weixin\.qq\.com|encrypted_query_param)[^\s)]*/g, '[微信图片]')
+  }
+
+  // Durable attachments are content-addressed under DSH_HOME:
+  // attachments/v1/objects/<sha256[:2]>/<sha256>. Deriving the path from the
+  // ref keeps the message useful when WeChat cannot render the image.
+  function attachmentObjectPath(attachmentId) {
+    if (typeof attachmentId !== 'string' || !attachmentId.startsWith('sha256:')) return null
+    const sha = attachmentId.slice('sha256:'.length)
+    if (!/^[0-9a-f]{64}$/.test(sha)) return null
+    return join(dshHome, 'attachments', 'v1', 'objects', sha.slice(0, 2), sha)
+  }
+
+  // ---- dated image mirror ---- //
+  // Human-readable copies under <workspace>/.dsh/attachments/<date>/ keep every
+  // image findable on disk even though WeChat cannot render it. The durable
+  // content-addressed store stays authoritative for the model; the mirror is
+  // for the user only. No auto-cleanup: the user owns retention.
+  function imageExtension(mediaType) {
+    const map = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' }
+    return map[mediaType] || '.img'
+  }
+
+  function mirrorImage(workspacePath, bytes, mediaType, prefix) {
+    if (!workspacePath || !bytes || bytes.length === 0) return null
+    try {
+      const d = new Date()
+      const pad = v => String(v).padStart(2, '0')
+      const dateDir = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+      const stamp = `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+      const dir = join(workspacePath, '.dsh', 'attachments', dateDir)
+      mkdirSync(dir, { recursive: true })
+      const file = join(dir, `${stamp}-${prefix}-${Math.random().toString(36).slice(2, 8)}${imageExtension(mediaType)}`)
+      writeFileSync(file, bytes)
+      return file
+    } catch (error) {
+      console.error('[weixin] mirror image failed:', error)
+      return null
+    }
+  }
+
+  // Workspace directory backing the mirror; falls back to the sandbox root.
+  function resolveWorkspacePath(workspaceId) {
+    const wr = ctx.get('workspaceRegistry')
+    if (wr !== undefined) {
+      try {
+        const ws = wr.get(workspaceId)
+        if (ws && typeof ws.path === 'string' && ws.path) return ws.path
+      } catch {
+        /* ignore */
+      }
+    }
+    const sp = ctx.get('sandboxPolicy')
+    return sp && typeof sp.workspaceRoot === 'string' ? sp.workspaceRoot : undefined
+  }
+
+  async function describeImageBytes(data) {
+    if (!data || data.length === 0) return null
+    try {
+      const res = await fetch('http://localhost:11434/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: VISION_MODEL,
+          prompt: '用一句中文描述这张图片的内容，不要猜测不存在的内容。',
+          images: [Buffer.from(data).toString('base64')],
+          stream: false,
+          think: false,
+          options: { num_predict: 80, temperature: 0.2 },
+        }),
+        signal: AbortSignal.timeout(VISION_TIMEOUT_MS),
+      })
+      if (!res.ok) return null
+      const payload = await res.json()
+      const text = String(payload.response || '').trim()
+      return text || null
+    } catch (error) {
+      console.error('[weixin] vision describe failed:', error && error.message ? error.message : error)
+      return null
+    }
+  }
+
+  // Builds the outbound reply from the turn's assistant content: text blocks
+  // cleaned of raw image links, image blocks described through local Ollama
+  // (or reduced to "[图片]" when the attachments seam or vision is unavailable).
+  async function buildReply(events, startSeq, attachments, workspacePath) {
     let text = ''
     for (let i = startSeq; i < events.length; i++) {
       const ev = events[i]
@@ -288,14 +387,30 @@ export function apply(ctx) {
       if (!msg || !Array.isArray(msg.content)) continue
       const parts = []
       for (const block of msg.content) {
-        if (block && block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-          parts.push(block.text)
+        if (!block) continue
+        if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+          parts.push(stripMarkdownImages(block.text))
+        } else if (block.type === 'image' && block.attachment) {
+          let label = '[图片]'
+          let storedPath = attachmentObjectPath(block.attachment.attachmentId)
+          if (attachments !== undefined) {
+            try {
+              const stored = await attachments.readImage(block.attachment)
+              const desc = await describeImageBytes(stored.data)
+              if (desc) label = `[图片：${desc}]`
+              const mirror = mirrorImage(workspacePath, stored.data, block.attachment.mediaType, 'reply')
+              if (mirror !== null) storedPath = mirror
+            } catch (error) {
+              console.error('[weixin] reply image read failed:', error)
+            }
+          }
+          parts.push(storedPath === null ? label : `${label}（存储路径：${storedPath}）`)
         }
       }
       const joined = parts.join('')
       if (joined.trim()) text = joined
     }
-    return text.trim()
+    return stripWechatMediaLinks(text).trim()
   }
 
   // ---- daily session ----
@@ -546,32 +661,48 @@ export function apply(ctx) {
 
     let attachment = null
     let imageAttached = false
+    let imageDescription = null
     const imageItem = items.find(i => i && i.type === 2 && i.image_item && i.image_item.media
       && (i.image_item.media.full_url || i.image_item.media.encrypt_query_param))
-    if (imageItem && await modelSupportsImages()) {
+    if (imageItem) {
       const img = await downloadDecryptImage(imageItem)
       if (img) {
-        try {
-          const attachments = ctx.get('attachments')
-          if (attachments !== undefined) {
-            attachment = await attachments.saveImage(img)
-            imageAttached = true
+        if (await modelSupportsImages()) {
+          try {
+            const attachments = ctx.get('attachments')
+            if (attachments !== undefined) {
+              attachment = await attachments.saveImage(img)
+              imageAttached = true
+              // Silent dated mirror so inbound images stay findable on disk.
+              mirrorImage(resolveWorkspacePath(targetWorkspaceId), img.data, img.mediaType, 'inbox')
+            }
+          } catch (error) {
+            console.error('[weixin] saveImage failed:', error)
+            attachment = null
+            imageAttached = false
           }
-        } catch (error) {
-          console.error('[weixin] saveImage failed:', error)
-          attachment = null
-          imageAttached = false
+        } else {
+          // Model lacks vision: describe the image through local Ollama so the
+          // agent still receives its content as readable text instead of an
+          // unopenable encrypted CDN link.
+          try {
+            imageDescription = await describeImageBytes(img.data)
+          } catch (error) {
+            console.error('[weixin] inbound image describe failed:', error)
+          }
         }
       }
     }
 
     const head = [`[微信 · ${senderLabel}]`]
+    if (imageDescription) head.push(`[图片：${imageDescription}]`)
     if (text) {
       head.push(sanitizeInbound(text))
     } else {
       for (const item of items) {
         if (!item || typeof item !== 'object') continue
         if (item.type === 1 || item.type === 3) continue
+        if (item.type === 2 && imageDescription) continue // already described above
         head.push(sanitizeInbound(mediaSummary(item, imageAttached)))
       }
       if (head.length === 1) head.push('(无文本内容)')
@@ -591,7 +722,7 @@ export function apply(ctx) {
         source: { kind: 'plugin', plugin: SOURCE_PLUGIN },
       })
       await agent.whenIdle()
-      const replyText = collectAssistantText(agent.session.events, startSeq)
+      const replyText = await buildReply(agent.session.events, startSeq, ctx.get('attachments'), resolveWorkspacePath(targetWorkspaceId))
       if (replyText) {
         try {
           await sendTextReply(sender, contextToken, replyText)
