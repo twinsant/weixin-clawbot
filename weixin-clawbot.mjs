@@ -31,6 +31,72 @@ const LONG_POLL_TIMEOUT_MS = 40_000
 const API_TIMEOUT_MS = 15_000
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
+// ---- approval-prompt redaction ---- //
+// The HITL prompt must say what is being approved, so field names and
+// non-secret values survive. It travels over WeChat, so anything that names or
+// looks like a credential is withheld and the host home path is collapsed.
+
+/** Stand-in for any value withheld from an approval prompt. */
+export const REDACTED = '[已隐去]'
+
+/** Longest rendered argument text one approval prompt carries. */
+export const MAX_ARGUMENT_CHARS = 600
+
+/** Longest single string value kept intact inside that rendering. */
+export const MAX_SCALAR_CHARS = 120
+
+/** Argument keys whose values never reach the WeChat transport. */
+const SECRET_KEY_PATTERN
+  = /secret|token|password|passwd|credential|cookie|signature|session|api[_-]?key|access[_-]?key|private[_-]?key|auth/i
+
+/** Value shapes that carry a credential whatever key holds them. */
+const SECRET_VALUE_PATTERNS = [
+  [/-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?-----END[^-]*PRIVATE KEY-----/g, REDACTED],
+  [/\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xoxb|xoxp|xoxa)[-_][A-Za-z0-9_-]{16,}/g, REDACTED],
+  [/\bAKIA[0-9A-Z]{16}\b/g, REDACTED],
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED],
+  [/\bbearer\s+[A-Z0-9._~+/-]{16,}={0,2}/gi, REDACTED],
+  [/([A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL)[A-Z0-9_]*\s*=\s*)\S+/gi, `$1${REDACTED}`],
+  [/\b[0-9a-fA-F]{32,}\b/g, REDACTED],
+  [/\b[A-Za-z0-9+/]{40,}={0,2}\b/g, REDACTED],
+]
+
+function scrubSecretShapes(text) {
+  return SECRET_VALUE_PATTERNS.reduce((carry, [pattern, replacement]) => carry.replace(pattern, replacement), text)
+}
+
+function redactValue(value, secretKey) {
+  if (secretKey) return REDACTED
+  if (typeof value === 'string') {
+    return value.length > MAX_SCALAR_CHARS ? `${value.slice(0, MAX_SCALAR_CHARS)}…` : value
+  }
+  if (Array.isArray(value)) return value.map(item => redactValue(item, false))
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value)
+      .map(([key, item]) => [key, redactValue(item, SECRET_KEY_PATTERN.test(key))]))
+  }
+  return value
+}
+
+/**
+ * Render one tool call's arguments for a WeChat approval prompt without
+ * disclosing credentials or the host's home directory.
+ * @param {string} json - raw `tool/call` argument JSON; unparseable text is scrubbed as-is.
+ * @param {string} [home] - host home directory collapsed to `~`; empty disables collapsing.
+ * @returns {string} prompt-safe argument text.
+ */
+export function redactToolArguments(json, home = '') {
+  let rendered
+  try {
+    rendered = JSON.stringify(redactValue(JSON.parse(json), false))
+  } catch {
+    rendered = json
+  }
+  const collapsed = home === '' ? rendered : rendered.split(home).join('~')
+  const scrubbed = scrubSecretShapes(collapsed)
+  return scrubbed.length > MAX_ARGUMENT_CHARS ? `${scrubbed.slice(0, MAX_ARGUMENT_CHARS)}…` : scrubbed
+}
+
 export function apply(ctx) {
   // ---- runtime state (restored from disk on startup) ----
   let bound = null // { accountId, token, baseUrl }
@@ -587,7 +653,8 @@ export function apply(ctx) {
           const ev = events[i]
           if (ev && ev.type === 'tool/call' && ev.data && ev.data.callId === req.callId) {
             const args = String(ev.data.arguments || '')
-            if (args && args !== '{}') lines.push(`参数: ${args.length > 600 ? `${args.slice(0, 600)}…` : args}`)
+            // The prompt travels over WeChat: withhold credentials and the home path.
+            if (args && args !== '{}') lines.push(`参数: ${redactToolArguments(args, homedir())}`)
             break
           }
         }
