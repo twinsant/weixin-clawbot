@@ -647,7 +647,7 @@ export function apply(ctx) {
   function describeToolCall(req) {
     const lines = [`工具: ${req.toolName}`]
     try {
-      const events = req.agent && req.agent.session && req.agent.session.events
+      const events = req.agent && req.agent.session && req.agent.session.snapshotEvents()
       if (req.callId && Array.isArray(events)) {
         for (let i = events.length - 1; i >= 0; i--) {
           const ev = events[i]
@@ -781,7 +781,7 @@ export function apply(ctx) {
     currentWeixinTarget = { senderId: sender, contextToken }
     try {
       const agent = await ensureDailyAgent(targetWorkspaceId)
-      const startSeq = agent.session.events.length
+      const startSeq = agent.session.snapshotEvents().length
       agent.followup({
         id: makeId('wxmsg'),
         role: 'user',
@@ -789,7 +789,7 @@ export function apply(ctx) {
         source: { kind: 'plugin', plugin: SOURCE_PLUGIN },
       })
       await agent.whenIdle()
-      const replyText = await buildReply(agent.session.events, startSeq, ctx.get('attachments'), resolveWorkspacePath(targetWorkspaceId))
+      const replyText = await buildReply(agent.session.snapshotEvents(), startSeq, ctx.get('attachments'), resolveWorkspacePath(targetWorkspaceId))
       if (replyText) {
         try {
           await sendTextReply(sender, contextToken, replyText)
